@@ -192,7 +192,11 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
             keys.append(f"{uid}_{session_id}_{i}")
             field = output.as_dict()
-            field.update(kwargs)
+            retained_kwargs = kwargs
+            if self.distillation_enabled and self.opsd_config.enabled:
+                retained_kwargs = dict(kwargs)
+                retained_kwargs.pop(self.opsd_config.teacher_prompt_key, None)
+            field.update(retained_kwargs)
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             # TODO: uniform response_mask and loss_mask

@@ -75,6 +75,68 @@ def _pad_teacher_outputs(
     )
 
 
+def _align_teacher_response_outputs(
+    teacher_ids: torch.Tensor,
+    teacher_logprobs: torch.Tensor,
+    *,
+    teacher_prompt_length: int,
+    student_prompt_length: int,
+    response_length: int,
+    pad_token_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align OPSD teacher distributions to the student's sequence layout.
+
+    Teacher and student prompts have different lengths in OPSD.  Both are
+    followed by the *same* student response, but a causal distribution for the
+    first response token is stored at ``prompt_length - 1``.  We therefore copy
+    only the teacher rows that predict response tokens into the corresponding
+    causal-output slots of a student-length tensor.  Privileged prompt rows never
+    enter the student's loss mask.
+    """
+    if teacher_prompt_length <= 0 or student_prompt_length <= 0:
+        raise ValueError(
+            "OPSD response alignment requires non-empty teacher and student prompts, "
+            f"but got {teacher_prompt_length=} and {student_prompt_length=}."
+        )
+    if response_length < 0:
+        raise ValueError(f"response_length must be non-negative, but got {response_length}.")
+    if teacher_ids.shape != teacher_logprobs.shape:
+        raise ValueError(
+            f"teacher_ids and teacher_logprobs must have equal shapes, got "
+            f"{tuple(teacher_ids.shape)} and {tuple(teacher_logprobs.shape)}."
+        )
+    expected_teacher_length = teacher_prompt_length + response_length
+    if teacher_ids.shape[0] != expected_teacher_length:
+        raise ValueError(
+            "Teacher output length must equal privileged prompt plus student response: "
+            f"got {teacher_ids.shape[0]=}, {teacher_prompt_length=}, {response_length=}."
+        )
+
+    student_sequence_length = student_prompt_length + response_length
+    aligned_shape = (student_sequence_length, *teacher_ids.shape[1:])
+    aligned_ids = torch.full(
+        aligned_shape,
+        fill_value=pad_token_id,
+        dtype=teacher_ids.dtype,
+        device=teacher_ids.device,
+    )
+    aligned_logprobs = torch.zeros(
+        aligned_shape,
+        dtype=teacher_logprobs.dtype,
+        device=teacher_logprobs.device,
+    )
+    if response_length == 0:
+        return aligned_ids, aligned_logprobs
+
+    teacher_start = teacher_prompt_length - 1
+    student_start = student_prompt_length - 1
+    teacher_slice = slice(teacher_start, teacher_start + response_length)
+    student_slice = slice(student_start, student_start + response_length)
+    aligned_ids[student_slice] = teacher_ids[teacher_slice]
+    aligned_logprobs[student_slice] = teacher_logprobs[teacher_slice]
+    return aligned_ids, aligned_logprobs
+
+
 class AsyncTeacherLLMServerManager:
     """Teacher-specific async client used for distillation logprob computation."""
 
@@ -124,6 +186,13 @@ class AsyncTeacherLLMServerManager:
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
         client = self.teacher_client[teacher_key]
+        max_input_length = teacher_model_config.inference.prompt_length
+        if max_input_length is not None and len(sequence_ids) > max_input_length:
+            mode = "OPSD privileged prompt + student response" if self.distillation_config.opsd.enabled else "sequence"
+            raise ValueError(
+                f"Teacher {mode} has {len(sequence_ids)} tokens, exceeding the configured "
+                f"teacher input capacity {max_input_length}."
+            )
         teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,

@@ -820,6 +820,16 @@ algorithm:
 distillation:
   _target_: verl.workers.config.DistillationConfig
   enabled: false
+  opsd:
+    _target_: verl.workers.config.OPSDConfig
+    enabled: false
+    teacher_prompt_key: opsd_teacher_prompt
+    max_teacher_prompt_length: null
+    teacher_apply_chat_template_kwargs: {}
+    beta: 0.0
+    temperature: 1.0
+    jsd_token_clip: 0.05
+    require_same_model: true
   distillation_loss:
     _target_: verl.workers.config.DistillationLossConfig
     loss_mode: k3

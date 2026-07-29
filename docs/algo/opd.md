@@ -2,7 +2,7 @@
 
 **Author:** [Jacob Helwig](https://jacobhelwig.github.io/)
 
-Last updated: 05/26/2026.
+Last updated: 07/28/2026.
 
 ## Background
 
@@ -155,11 +155,12 @@ MOPD consolidates multiple specialized policies into a single student model whil
 
 ## Configuration Parameters
 
-OPD parameters live under three namespaces:
+OPD parameters live under three core namespaces, with a fourth optional OPSD namespace:
 
 - `distillation.*` — top-level switches and the teacher resource pool ([`DistillationConfig`](../../verl/workers/config/distillation.py))
 - `distillation.teacher_models.<name>.*` — one entry per teacher ([`DistillationTeacherModelConfig`](../../verl/workers/config/distillation.py))
 - `distillation.distillation_loss.*` — loss-mode and aggregation settings ([`DistillationLossConfig`](../../verl/workers/config/distillation.py))
+- `distillation.opsd.*` — privileged-context self-distillation settings ([`OPSDConfig`](../../verl/workers/config/distillation.py))
 
 Defaults below are the YAML defaults from
 [`verl/trainer/config/distillation/distillation.yaml`](../../verl/trainer/config/distillation/distillation.yaml).
@@ -608,6 +609,228 @@ The overlap metrics follow the token-level top-$k$ overlap analysis in [8].
 They are logging-only diagnostics and do not change the distillation loss or
 gradient.
 
+## Privileged-Context On-Policy Self-Distillation (OPSD)
+
+This repository also supports a verl translation of
+[siyan-zhao/OPSD@7448751](https://github.com/siyan-zhao/OPSD/tree/7448751f307a9cdbcc1246dd1565a1a605b443df)
+[9]. OPSD is not merely
+ordinary OPD with the same student and teacher checkpoint. It changes the
+teacher's information set while preserving the student's on-policy state
+occupancy:
+
+1. The student sees a problem-only prompt $x$ and samples one response
+   $\hat y \sim p_\theta(\cdot\mid x)$.
+2. A frozen copy of the student's initial checkpoint is the teacher.
+3. The teacher sees a privileged prompt $(x,y^*)$ containing a verified
+   reference solution, followed by the **same** sampled response tokens
+   $\hat y$.
+4. The teacher does not generate a second solution. It performs a forward pass
+   and supplies next-token distributions along the student's trajectory.
+
+The public reference trainer supports dynamic, fixed, and EMA teachers. Its
+main fixed-teacher setup is the one implemented here: a separate verl teacher
+server loads the same initial checkpoint as the student and remains frozen.
+This is semantically equivalent even though the reference TRL implementation
+physically disables a LoRA adapter in the same process.
+
+### Data schema and causal alignment
+
+Each training row must contain two prompts:
+
+```python
+{
+    "prompt": [{"role": "user", "content": "problem only ..."}],
+    "opsd_teacher_prompt": [
+        {"role": "user", "content": "problem + verified reference solution ..."}
+    ],
+}
+```
+
+`prompt` is rendered by the ordinary agent loop. The field named by
+`distillation.opsd.teacher_prompt_key` is rendered separately for the teacher.
+It may contain chat messages or pre-tokenized ids. Reference solutions are
+never silently truncated: a rendered prompt longer than
+`max_teacher_prompt_length` raises.
+
+Teacher and student prompt lengths generally differ. For a teacher prompt of
+length $P_T$, student prompt of length $P_S$, and response length $R$, the
+teacher request is
+
+```text
+teacher_prompt_ids[0:P_T] + student_response_ids[0:R]
+```
+
+The causal rows predicting response tokens are teacher rows
+`P_T - 1 : P_T - 1 + R`. Only these rows are copied to student causal-output
+slots `P_S - 1 : P_S - 1 + R`. Privileged-prefix rows therefore never enter
+the response loss, and the first student response token is supervised by the
+distribution after the complete privileged prompt. After teacher scoring, the
+raw privileged prompt is dropped before the rollout enters the training replay
+buffer; only the aligned teacher ids/log-probabilities are retained.
+
+Use the provided preprocessing script to build this schema without binding the
+parquet files to a tokenizer. Its text matches the reference collator's default
+`reason_first=false` prompt path:
+
+```bash
+python3 examples/data_preprocess/opsd.py \
+  --local_save_dir "$HOME/data/opsd"
+```
+
+### Generalized JSD objective
+
+At response position $t$, let $p_t$ denote the student distribution and $q_t$
+the privileged teacher distribution at temperature $T$. For $0<\beta<1$,
+
+$$
+m_t=(1-\beta)p_t+\beta q_t,
+$$
+
+$$
+D_\beta(p_t,q_t)
+=\beta\,\mathrm{KL}(q_t\Vert m_t)
++(1-\beta)\,\mathrm{KL}(p_t\Vert m_t).
+$$
+
+The endpoints are special cases from the reference implementation rather than
+the degenerate endpoints of the mixture expression:
+
+$$
+D_0(p_t,q_t)=\mathrm{KL}(q_t\Vert p_t),\qquad
+D_1(p_t,q_t)=\mathrm{KL}(p_t\Vert q_t).
+$$
+
+The teacher is always stop-gradient. There is no $T^2$ knowledge-distillation
+multiplier.
+
+The reference trainer applies `jsd_token_clip` to each vocabulary-entry
+contribution before their sum. For the common $\beta=0$ case,
+
+$$
+\mathcal L_t
+=\sum_v \min\left(
+q_t(v)[\log q_t(v)-\log p_t(v)],\tau
+\right).
+$$
+
+Negative contributions are retained. Consequently, a clipped per-position
+total can be negative. OPSD therefore has a separate loss collector and does
+not use ordinary OPD's final `clamp_min(0)` or `loss_max_clamp`.
+
+### Current verl top-k mapping
+
+The OPSD paper's main runs use full-vocabulary forward KL. verl's current
+teacher inference API returns selected prompt log-probabilities rather than a
+full `[sequence, vocabulary]` tensor, so this implementation exposes the
+reference repository's optional teacher-top-k approximation under
+`loss_mode=opsd_gjsd_topk`.
+
+For teacher top-k support $A_t$, both distributions are independently
+renormalized on the same support:
+
+$$
+\hat q_t(v)=\frac{q_t(v)}{\sum_{u\in A_t}q_t(u)},\qquad
+\hat p_t(v)=\frac{p_t(v)}{\sum_{u\in A_t}p_t(u)}.
+$$
+
+Generalized JSD and pointwise clipping are then evaluated using
+$\hat p_t,\hat q_t$. This differs from `forward_kl_topk`, which uses truncated
+full-vocabulary probabilities without renormalization. In particular, OPSD
+top-k sends no gradient to student logits outside $A_t$.
+
+Teacher servers return log-probabilities at temperature one. Within the top-k
+support, the temperature-$T$ teacher distribution is recovered exactly as
+
+$$
+\log \hat q_t^{(T)}(v)
+=\ell_t(v)/T-\operatorname{logsumexp}_{u\in A_t}(\ell_t(u)/T).
+$$
+
+Student logits have already been divided by rollout temperature before the
+logits processor runs. Configuration validation therefore requires
+`distillation.opsd.temperature == actor_rollout_ref.rollout.temperature`.
+
+### Configuration and launch
+
+The minimal fixed-teacher configuration is:
+
+```yaml
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen3-1.7B
+    lora_rank: 64
+    lora_alpha: 128
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    use_fused_kernels: false
+  actor:
+    strategy: fsdp
+    use_kl_loss: false
+  rollout:
+    temperature: 1.1
+
+algorithm:
+  use_kl_in_reward: false
+
+distillation:
+  enabled: true
+  teacher_models:
+    teacher_model:
+      model_path: Qwen/Qwen3-1.7B
+      inference:
+        temperature: 1.0
+  opsd:
+    enabled: true
+    teacher_prompt_key: opsd_teacher_prompt
+    max_teacher_prompt_length: 20000
+    teacher_apply_chat_template_kwargs:
+      enable_thinking: true
+    beta: 0.0
+    temperature: 1.1
+    jsd_token_clip: 0.05
+    require_same_model: true
+  distillation_loss:
+    loss_mode: opsd_gjsd_topk
+    topk: 128
+    use_task_rewards: false
+    use_policy_gradient: false
+    loss_max_clamp: null
+```
+
+The complete example is:
+
+```bash
+bash examples/on_policy_distillation_trainer/run_qwen3_1.7b_opsd_fsdp.sh
+```
+
+The rollout `top_k=20` in the reference launch recipe is a sampling parameter;
+it is unrelated to `distillation.distillation_loss.topk`, which controls the
+teacher distribution support.
+
+Current fail-closed boundaries are:
+
+- fixed single teacher only; dynamic and EMA teacher synchronization are not implemented;
+- the optional `reason_first` teacher-rationalization stage and sampled-token Tinker/PG objective are not implemented;
+- eager FSDP/VeOmni only; Megatron generalized-JSD backward is not implemented;
+- fused top-k kernels are disabled because they implement ordinary truncated FKL;
+- one single-turn text rollout per problem; tool/multi-turn and continuous-token modes are not supported;
+- actor-only model config overrides, preloaded adapters, remote-code models, and external model libraries are rejected in strict same-model mode because the frozen teacher currently loads from the shared checkpoint path only;
+- teacher-top-k approximation, not a claim of full-vocabulary main-result reproduction.
+
+During a GPU validation run, monitor
+`actor/distillation/opsd_unclipped_loss`,
+`actor/distillation/opsd_clipped_fraction`,
+`actor/distillation/opsd_student_topk_mass_at_temperature`, and
+`actor/distillation/opsd_teacher_topk_mass_t1`. The two mass diagnostics have
+different temperature conventions: the student mass comes from the
+temperature-scaled training logits, while the teacher mass comes directly from
+the inference server at temperature one. They should not be compared as if
+they were probabilities from the same distribution. A nonzero clipped fraction
+is expected when pointwise clipping activates; a negative aggregated token loss
+is valid and must not be treated as an error by itself.
+
+[9] Zhao, Siyan, et al. "On-Policy Self-Distillation."
+[arXiv:2601.18734](https://arxiv.org/abs/2601.18734), 2026.
+
 ## Debugging
 
 A useful technique for debugging modifications and additions to the distillation pipeline is to set the student to be the same model as the teacher. The loss should be approximately zero (not exact, due to differences between train/inference engines). 
@@ -744,9 +967,9 @@ The returned scalar loss is what `engine.train_batch` backpropagates.
 ### **Core Implementation**
 
 - `verl/experimental/teacher_loop/teacher_model.py` — `MultiTeacherModelManager` and `TeacherModelManager`; spin up teacher inference replicas on the dedicated teacher resource pool and expose per-teacher `LLMServerClient` factories
-- `verl/experimental/teacher_loop/teacher_manager.py` — `AsyncTeacherLLMServerManager`; routes per-sample teacher calls (single- or multi-teacher) and builds teacher sampling params
-- `verl/experimental/agent_loop/agent_loop.py` — `AgentLoopWorker._compute_teacher_logprobs`; per-sample teacher dispatch from `_agent_loop_postprocess`, packs `teacher_logprobs` into the rollout output
-- `verl/trainer/distillation/fsdp/losses.py` — FSDP backend `compute_forward_kl_topk`
+- `verl/experimental/teacher_loop/teacher_manager.py` — `AsyncTeacherLLMServerManager`; routes per-sample teacher calls, builds teacher sampling params, and aligns OPSD response rows across unequal prompt lengths
+- `verl/experimental/agent_loop/agent_loop.py` — `AgentLoopWorker._compute_teacher_logprobs`; renders OPSD privileged prompts, dispatches per-sample teacher scoring, and packs response-aligned `teacher_logprobs`
+- `verl/trainer/distillation/fsdp/losses.py` — FSDP backends `compute_forward_kl_topk` and `compute_opsd_gjsd_topk`
 - `verl/trainer/distillation/megatron/losses.py` — Megatron backend `compute_forward_kl_topk`
 - `verl/workers/engine_workers.py` — `ActorRolloutRefWorker.init_model`; binds `distillation_ppo_loss` as the actor's `loss_fn` when distillation is enabled
 - `verl/workers/engine/{fsdp,megatron}/transformer_impl.py` — training-engine forward steps; invoke `distillation_ppo_loss` first as a logits processor (top-$k$ modes) and again as the final loss
@@ -770,6 +993,8 @@ The returned scalar loss is what `engine.train_batch` backpropagates.
 - `examples/on_policy_distillation_trainer/run_qwen3_8b_megatron.sh` — text, vLLM rollout, Megatron student, single teacher
 - `examples/on_policy_distillation_trainer/run_qwen3_vl_8b_fsdp.sh` — VL student/teacher, vLLM rollout, FSDP student
 - `examples/on_policy_distillation_trainer/run_qwen3_8b_mopd_fsdp.sh` — multi-teacher (gsm8k text + geo3k VL), routed by `data_source`
+- `examples/on_policy_distillation_trainer/run_qwen3_1.7b_opsd_fsdp.sh` — fixed same-checkpoint teacher with privileged solution context and OPSD top-k generalized JSD
+- `examples/data_preprocess/opsd.py` — produces problem-only student prompts and solution-conditioned teacher prompts
 
 ### **Tests**
 

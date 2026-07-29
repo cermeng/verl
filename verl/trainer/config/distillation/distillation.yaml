@@ -13,6 +13,39 @@ defaults:
 # Whether to enable distillation.
 enabled: false
 
+# Privileged-context on-policy self-distillation (OPSD). This remains off for
+# ordinary OPD. The current implementation is the teacher-top-k approximation
+# from the reference OPSD trainer, not its full-vocabulary main objective.
+opsd:
+
+  # Required when converting this section to OPSDConfig.
+  _target_: verl.workers.config.OPSDConfig
+
+  # Whether to use privileged-context self-distillation semantics.
+  enabled: false
+
+  # Dataset field containing privileged teacher chat messages or token ids.
+  teacher_prompt_key: opsd_teacher_prompt
+
+  # Required when OPSD is enabled. Reference solutions are never truncated.
+  max_teacher_prompt_length: null
+
+  # Merged over data.apply_chat_template_kwargs only for the teacher prompt.
+  teacher_apply_chat_template_kwargs: {}
+
+  # beta=0: forward KL; beta=1: reverse KL; 0<beta<1: generalized JSD.
+  beta: 0.0
+
+  # Must match actor_rollout_ref.rollout.temperature because student logits are
+  # temperature-scaled before the distillation logits processor runs.
+  temperature: 1.0
+
+  # Upper clamp on each vocabulary-entry contribution before their sum.
+  jsd_token_clip: 0.05
+
+  # Fixed-teacher OPSD loads the same initial checkpoint as the student.
+  require_same_model: true
+
 # distillation loss config
 distillation_loss:
 

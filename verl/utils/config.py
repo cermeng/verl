@@ -20,6 +20,103 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 __all__ = ["omega_conf_to_dataclass", "validate_config"]
 
 
+def _validate_opsd_runtime_config(config: DictConfig) -> None:
+    """Fail closed for OPSD combinations whose objective is not implemented."""
+    distillation = config.get("distillation")
+    if not distillation or not distillation.get("enabled", False):
+        return
+    opsd = distillation.get("opsd")
+    if not opsd or not opsd.get("enabled", False):
+        return
+
+    # Instantiate the complete distillation dataclass during top-level config
+    # validation so invalid OPSD loss/teacher settings fail before Ray creates
+    # any actor or inference workers.
+    omega_conf_to_dataclass(distillation)
+
+    strategy = config.actor_rollout_ref.actor.strategy
+    if strategy not in {"fsdp", "veomni"}:
+        raise NotImplementedError(
+            f"OPSD generalized JSD supports eager FSDP/VeOmni only, but got actor strategy {strategy!r}."
+        )
+    if config.actor_rollout_ref.model.get("use_fused_kernels", False):
+        raise ValueError(
+            "OPSD generalized JSD is not implemented by the fused top-k kernel. "
+            "Set actor_rollout_ref.model.use_fused_kernels=false."
+        )
+    if config.actor_rollout_ref.actor.loss_agg_mode != "token-mean":
+        raise ValueError(
+            "The OPSD reference trainer averages over valid response tokens. "
+            "Set actor_rollout_ref.actor.loss_agg_mode='token-mean'."
+        )
+    if config.actor_rollout_ref.actor.use_kl_loss or config.algorithm.get("use_kl_in_reward", False):
+        raise ValueError(
+            "PPO reference-policy KL is not part of OPSD. Disable actor.use_kl_loss and algorithm.use_kl_in_reward."
+        )
+    if config.actor_rollout_ref.rollout.n != 1:
+        raise ValueError("The translated OPSD data flow currently requires actor_rollout_ref.rollout.n=1.")
+    if config.actor_rollout_ref.rollout.multi_turn.enable:
+        raise ValueError("The translated OPSD data flow currently supports single-turn text rollouts only.")
+    if config.actor_rollout_ref.rollout.agent.default_agent_loop != "single_turn_agent":
+        raise ValueError("OPSD currently requires rollout.agent.default_agent_loop='single_turn_agent'.")
+    continuous_token = config.data.get("continuous_token")
+    if continuous_token is not None and continuous_token.get("enable", False):
+        raise ValueError("OPSD privileged prompt alignment does not currently support continuous-token mode.")
+
+    rollout_temperature = float(config.actor_rollout_ref.rollout.temperature)
+    opsd_temperature = float(opsd.temperature)
+    if abs(rollout_temperature - opsd_temperature) > 1e-8:
+        raise ValueError(
+            "OPSD teacher temperature must equal actor_rollout_ref.rollout.temperature because "
+            "student logits are scaled before the distillation processor: "
+            f"got {opsd_temperature=} and {rollout_temperature=}."
+        )
+
+    if opsd.get("require_same_model", True):
+        teacher_entries = distillation.teacher_models
+        if set(teacher_entries.keys()) != {"teacher_model"}:
+            raise ValueError("OPSD fixed-teacher mode requires exactly the default single teacher_model entry.")
+        teacher_path = teacher_entries.teacher_model.model_path
+        student_path = config.actor_rollout_ref.model.path
+        if teacher_path != student_path:
+            raise ValueError(
+                "OPSD fixed teacher must load the student's initial checkpoint. "
+                f"Got teacher model_path={teacher_path!r} and student path={student_path!r}."
+            )
+        tokenizer_path = config.actor_rollout_ref.model.get("tokenizer_path")
+        if tokenizer_path is not None and tokenizer_path != student_path:
+            raise ValueError(
+                "OPSD teacher consumes token ids from the student tokenizer. A custom tokenizer_path is only "
+                "supported when it equals the shared initial model path."
+            )
+        if config.actor_rollout_ref.model.get("override_config", {}):
+            raise ValueError(
+                "OPSD require_same_model=true does not support actor-only override_config values because "
+                "the frozen teacher server loads the unmodified checkpoint configuration."
+            )
+        hf_config_path = config.actor_rollout_ref.model.get("hf_config_path")
+        if hf_config_path is not None and hf_config_path != student_path:
+            raise ValueError(
+                "OPSD require_same_model=true only supports hf_config_path when it equals the shared initial "
+                "model path, because the frozen teacher loads its config from model_path."
+            )
+        if config.actor_rollout_ref.model.get("lora_adapter_path") is not None:
+            raise ValueError(
+                "OPSD require_same_model=true does not support a preloaded student lora_adapter_path because "
+                "the frozen teacher server loads only the shared base checkpoint."
+            )
+        if config.actor_rollout_ref.model.get("trust_remote_code", False):
+            raise ValueError(
+                "OPSD require_same_model=true does not currently support trust_remote_code=true because "
+                "the frozen teacher server loads its HFModelConfig from model_path only."
+            )
+        if config.actor_rollout_ref.model.get("external_lib") is not None:
+            raise ValueError(
+                "OPSD require_same_model=true does not currently support actor external_lib because the "
+                "frozen teacher server does not receive that actor-only import configuration."
+            )
+
+
 def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[type[Any]] = None) -> Any:
     """
     Convert an OmegaConf DictConfig to a dataclass.
@@ -198,5 +295,7 @@ def validate_config(
         from verl.workers.rollout.vllm_rollout.utils import get_vllm_max_lora_rank
 
         get_vllm_max_lora_rank(lora_rank)
+
+    _validate_opsd_runtime_config(config)
 
     print("[validate_config] All configuration checks passed successfully!")

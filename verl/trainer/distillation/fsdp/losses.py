@@ -72,6 +72,117 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
     return kld.sum(dim=-1)
 
 
+def generalized_jsd_pointwise(
+    student_log_probs: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    beta: float,
+    token_clip: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute OPSD generalized-JSD contributions on a shared support.
+
+    ``student_log_probs`` and ``teacher_log_probs`` must each be normalized on
+    their last dimension.  The beta endpoints intentionally use KL rather than
+    the degenerate endpoint of the mixture expression, matching the OPSD
+    objective.  Clipping is applied to each vocabulary-entry contribution
+    *before* summation; negative contributions are preserved.
+
+    Returns the clipped per-position loss, the unclipped per-position loss, and
+    the fraction of vocabulary entries clipped at each position.
+    """
+    student_log_probs = student_log_probs.float()
+    teacher_log_probs = teacher_log_probs.detach().float()
+    student_probs = student_log_probs.exp()
+    teacher_probs = teacher_log_probs.exp()
+
+    if beta == 0.0:
+        contributions = teacher_probs * (teacher_log_probs - student_log_probs)
+    elif beta == 1.0:
+        contributions = student_probs * (student_log_probs - teacher_log_probs)
+    else:
+        log_beta = torch.log(student_log_probs.new_tensor(beta))
+        log_one_minus_beta = torch.log(student_log_probs.new_tensor(1.0 - beta))
+        mixture_log_probs = torch.logaddexp(
+            student_log_probs + log_one_minus_beta,
+            teacher_log_probs + log_beta,
+        )
+        contributions = beta * teacher_probs * (teacher_log_probs - mixture_log_probs) + (
+            1.0 - beta
+        ) * student_probs * (student_log_probs - mixture_log_probs)
+
+    unclipped_losses = contributions.sum(dim=-1)
+    if token_clip is None:
+        clipped_fraction = torch.zeros_like(unclipped_losses)
+        clipped_contributions = contributions
+    else:
+        clipped_mask = contributions > token_clip
+        clipped_fraction = clipped_mask.float().mean(dim=-1)
+        clipped_contributions = contributions.clamp(max=token_clip)
+    return clipped_contributions.sum(dim=-1), unclipped_losses, clipped_fraction
+
+
+def compute_opsd_gjsd_topk(
+    student_logits: torch.Tensor,
+    teacher_topk_log_probs: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    config: DistillationConfig,
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Compute the teacher-top-k approximation of the OPSD generalized JSD.
+
+    The teacher chooses the support.  Student and teacher distributions are
+    separately renormalized on that same support before the divergence is
+    evaluated, so logits outside the support receive no OPSD gradient.  This is
+    distinct from ``compute_forward_kl_topk``, which uses truncated full-vocab
+    probabilities without renormalization.
+
+    ``student_logits`` have already been divided by rollout temperature by the
+    actor engine.  Teacher prompt log-probabilities are returned at temperature
+    one, so they are divided by ``config.opsd.temperature`` before top-k
+    renormalization.
+    """
+    del data_format  # FSDP handles THD/BSHD identically at this stage.
+    assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
+    teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)
+    teacher_topk_ids = teacher_topk_ids.values().unsqueeze(0).long()
+
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_topk_log_probs = slice_input_tensor(teacher_topk_log_probs, dim=1)
+        teacher_topk_ids = slice_input_tensor(teacher_topk_ids, dim=1)
+    assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
+
+    # Selecting logits before log_softmax is important: OPSD's optional top-k
+    # objective renormalizes on the teacher support, unlike truncated FKL.
+    selected_student_logits = torch.gather(student_logits, dim=-1, index=teacher_topk_ids)
+    student_subset_log_probs = F.log_softmax(selected_student_logits.float(), dim=-1)
+
+    opsd_config = config.opsd
+    teacher_subset_log_probs = F.log_softmax(
+        teacher_topk_log_probs.detach().float() / opsd_config.temperature,
+        dim=-1,
+    )
+    distillation_losses, unclipped_losses, clipped_fraction = generalized_jsd_pointwise(
+        student_log_probs=student_subset_log_probs,
+        teacher_log_probs=teacher_subset_log_probs,
+        beta=opsd_config.beta,
+        token_clip=opsd_config.jsd_token_clip,
+    )
+
+    # These masses are diagnostics only and intentionally use the distributions
+    # available from the servers before top-k renormalization.
+    student_log_z = torch.logsumexp(student_logits.float(), dim=-1, keepdim=True)
+    selected_student_full_log_probs = selected_student_logits.float() - student_log_z
+    student_mass = selected_student_full_log_probs.exp().sum(dim=-1).detach()
+    teacher_mass = teacher_topk_log_probs.detach().float().exp().sum(dim=-1)
+
+    return {
+        "distillation_losses": distillation_losses,
+        "student_mass": student_mass,
+        "teacher_mass": teacher_mass,
+        "opsd_unclipped_losses": unclipped_losses.detach(),
+        "opsd_clipped_fraction": clipped_fraction.detach(),
+    }
+
+
 def compute_forward_kl_topk(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,

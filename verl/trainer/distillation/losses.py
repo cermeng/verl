@@ -134,13 +134,25 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    loss_mode = distillation_config.distillation_loss.loss_mode
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         case "fsdp" | "veomni":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            match loss_mode:
+                case "forward_kl_topk":
+                    distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+                case "opsd_gjsd_topk":
+                    distillation_loss_fn = fsdp_losses.compute_opsd_gjsd_topk
+                case _:
+                    raise ValueError(f"No FSDP top-k implementation registered for {loss_mode=}.")
         case "megatron":
+            if loss_mode == "opsd_gjsd_topk":
+                raise NotImplementedError(
+                    "OPSD generalized JSD is not implemented for Megatron. Use eager FSDP/VeOmni; "
+                    "falling back to Megatron's truncated forward KL would change the objective."
+                )
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
@@ -359,6 +371,64 @@ def compute_forward_kl_topk(
     distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names=["opsd_gjsd_topk"], use_topk=True))  # type: ignore[arg-type]
+def compute_opsd_gjsd_topk(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Collect response-aligned OPSD top-k generalized-JSD loss and metrics.
+
+    Unlike the ordinary truncated top-k FKL collector, this function must not
+    clamp the summed per-position loss to be non-negative.  OPSD clips positive
+    vocabulary-entry contributions before summation while retaining negative
+    entries, so a clipped position can legitimately have a negative total.
+    """
+    del config
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    unclipped_losses = no_padding_2_padding(model_output["opsd_unclipped_losses"], data)
+    clipped_fraction = no_padding_2_padding(model_output["opsd_clipped_fraction"], data)
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+
+    if data["response_mask"].is_nested:
+        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
+    else:
+        response_mask_bool = data["response_mask"].bool()
+    assert (
+        distillation_losses.shape
+        == unclipped_losses.shape
+        == clipped_fraction.shape
+        == student_mass.shape
+        == teacher_mass.shape
+        == response_mask_bool.shape
+    )
+
+    valid_student_mass = student_mass[response_mask_bool]
+    valid_teacher_mass = teacher_mass[response_mask_bool]
+    valid_unclipped = unclipped_losses[response_mask_bool]
+    valid_clipped_fraction = clipped_fraction[response_mask_bool]
+    opsd_config = distillation_config.opsd
+    metrics = {
+        "distillation/opsd_student_topk_mass_at_temperature": valid_student_mass.mean().item(),
+        "distillation/opsd_student_topk_mass_at_temperature_min": Metric(
+            AggregationType.MIN, valid_student_mass.min()
+        ),
+        "distillation/opsd_student_topk_mass_at_temperature_max": Metric(
+            AggregationType.MAX, valid_student_mass.max()
+        ),
+        "distillation/opsd_teacher_topk_mass_t1": valid_teacher_mass.mean().item(),
+        "distillation/opsd_teacher_topk_mass_t1_min": Metric(AggregationType.MIN, valid_teacher_mass.min()),
+        "distillation/opsd_teacher_topk_mass_t1_max": Metric(AggregationType.MAX, valid_teacher_mass.max()),
+        "distillation/opsd_unclipped_loss": valid_unclipped.mean().item(),
+        "distillation/opsd_clipped_fraction": valid_clipped_fraction.mean().item(),
+        "distillation/opsd_beta": opsd_config.beta,
+        "distillation/opsd_temperature": opsd_config.temperature,
+    }
+    return distillation_losses, metrics
 
 
 @register_distillation_loss(

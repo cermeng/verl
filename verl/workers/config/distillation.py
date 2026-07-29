@@ -22,7 +22,12 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = [
+    "DistillationLossConfig",
+    "DistillationTeacherModelConfig",
+    "OPSDConfig",
+    "DistillationConfig",
+]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -169,19 +174,25 @@ class DistillationTeacherModelConfig(BaseConfig):
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
-    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
-        # Prompt + Response from student are fed into teacher as context
+    def validate_and_prepare_for_distillation(
+        self,
+        use_topk: bool,
+        topk: Optional[int],
+        teacher_prompt_length: Optional[int] = None,
+    ) -> None:
+        # Ordinary OPD uses the student prompt; OPSD substitutes the longer
+        # privileged teacher prompt. Both score the complete student response.
         max_model_len = self.inference.max_model_len
-        student_prompt_length = self.inference.prompt_length
+        prompt_length = self.inference.prompt_length if teacher_prompt_length is None else teacher_prompt_length
         student_response_length = self.inference.response_length
-        required_context_len = student_prompt_length + student_response_length + 1
+        required_context_len = prompt_length + student_response_length + 1
         if max_model_len is not None and required_context_len > max_model_len:
             raise ValueError(
-                "Distillation teacher inference requires room for the student prompt, the full student "
-                f"response, and one generated token, but got {student_prompt_length=}, "
+                "Distillation teacher inference requires room for the teacher prompt, the full student "
+                f"response, and one generated token, but got {prompt_length=}, "
                 f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
             )
-        self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
+        self.inference.prompt_length = prompt_length + self.inference.response_length
         self.inference.response_length = 1
         self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
 
@@ -215,6 +226,71 @@ class DistillationTeacherModelConfig(BaseConfig):
             case _:
                 raise NotImplementedError(
                     f"DistillationTeacherModelConfig does not support inference engine {engine_name}"
+                )
+
+
+@dataclass
+class OPSDConfig(BaseConfig):
+    """Configuration for privileged-context on-policy self-distillation (OPSD).
+
+    This implementation uses a separately served, frozen copy of the student's
+    initial checkpoint as the teacher.  The dataset supplies a privileged teacher
+    prompt (normally the problem plus a verified reference solution), while the
+    student rollout sees only the ordinary prompt.
+
+    enabled (bool):
+        Enable OPSD semantics on top of the generic distillation pipeline.
+    teacher_prompt_key (str):
+        Dataset field containing either chat messages or pre-tokenized prompt ids
+        for the privileged teacher context.
+    max_teacher_prompt_length (int, optional):
+        Maximum number of tokens in the privileged teacher prompt.  OPSD fails
+        rather than truncating a reference solution.
+    teacher_apply_chat_template_kwargs (dict):
+        Overrides applied only when rendering the privileged teacher prompt.  For
+        example, Qwen can use ``enable_thinking: true`` for the teacher while the
+        student data config uses ``enable_thinking: false``.
+    beta (float):
+        Generalized-JSD parameter.  The endpoints are special-cased: beta=0 is
+        forward KL (teacher || student), beta=1 is reverse KL.
+    temperature (float):
+        Temperature applied to teacher log probabilities before top-k
+        renormalization.  Student logits have already been divided by the rollout
+        temperature, so validation requires these temperatures to match.
+    jsd_token_clip (float, optional):
+        Upper clamp applied to each vocabulary-entry contribution before summing.
+        Negative contributions are intentionally not clipped.
+    require_same_model (bool):
+        Require the frozen teacher and student effective initial model setup to
+        match. Runtime validation compares checkpoint/tokenizer/config paths and
+        rejects actor-only model-loading overrides that are not forwarded to the
+        teacher server.
+    """
+
+    enabled: bool = False
+    teacher_prompt_key: str = "opsd_teacher_prompt"
+    max_teacher_prompt_length: Optional[int] = None
+    teacher_apply_chat_template_kwargs: dict = field(default_factory=dict)
+    beta: float = 0.0
+    temperature: float = 1.0
+    jsd_token_clip: Optional[float] = 0.05
+    require_same_model: bool = True
+
+    def __post_init__(self):
+        if not 0.0 <= self.beta <= 1.0:
+            raise ValueError(f"OPSD beta must be in [0, 1], but got {self.beta}.")
+        if self.temperature <= 0:
+            raise ValueError(f"OPSD temperature must be positive, but got {self.temperature}.")
+        if self.jsd_token_clip is not None and self.jsd_token_clip <= 0:
+            raise ValueError(
+                f"OPSD jsd_token_clip must be positive or null, but got {self.jsd_token_clip}."
+            )
+        if self.enabled:
+            if not self.teacher_prompt_key:
+                raise ValueError("OPSD teacher_prompt_key must be non-empty.")
+            if self.max_teacher_prompt_length is None or self.max_teacher_prompt_length <= 0:
+                raise ValueError(
+                    "OPSD max_teacher_prompt_length must be a positive integer when OPSD is enabled."
                 )
 
 
@@ -265,17 +341,49 @@ class DistillationConfig(BaseConfig):
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    opsd: OPSDConfig = field(default_factory=OPSDConfig)
 
     def __post_init__(self):
+        if self.opsd.enabled and not self.enabled:
+            raise ValueError("distillation.enabled must be true when distillation.opsd.enabled is true.")
         if not self.enabled:
             return
 
+        if self.opsd.enabled:
+            if self.distillation_loss.loss_mode != "opsd_gjsd_topk":
+                raise ValueError(
+                    "OPSD currently requires distillation_loss.loss_mode='opsd_gjsd_topk', "
+                    f"but got {self.distillation_loss.loss_mode!r}."
+                )
+            if self.distillation_loss.use_policy_gradient:
+                raise ValueError("OPSD generalized JSD must use direct backpropagation (use_policy_gradient=false).")
+            if self.distillation_loss.use_task_rewards:
+                raise ValueError("OPSD translation requires use_task_rewards=false; task rewards define a hybrid loss.")
+            if self.distillation_loss.topk is None or self.distillation_loss.topk < 2:
+                raise ValueError(
+                    "OPSD generalized JSD requires distillation_loss.topk >= 2; a one-token support "
+                    "renormalizes both distributions to probability one and has zero loss."
+                )
+            if self.distillation_loss.loss_max_clamp is not None:
+                raise ValueError(
+                    "OPSD uses vocabulary-entry pointwise clipping. Set distillation_loss.loss_max_clamp=null "
+                    "to avoid adding a different per-position clamp."
+                )
+            if self.distillation_loss.log_prob_min_clamp is not None:
+                raise ValueError(
+                    "OPSD renormalizes on the teacher top-k support and does not use log-probability clamping. "
+                    "Set distillation_loss.log_prob_min_clamp=null."
+                )
+
         self.teacher_models = self._resolve_teacher_models()
+        if self.opsd.enabled and len(self.teacher_models) != 1:
+            raise ValueError("OPSD currently supports exactly one frozen teacher model.")
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
+                teacher_prompt_length=(self.opsd.max_teacher_prompt_length if self.opsd.enabled else None),
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

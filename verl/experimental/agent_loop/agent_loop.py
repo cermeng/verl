@@ -525,6 +525,7 @@ class AgentLoopWorker:
                 config=config,
                 teacher_client=teacher_client,
             )
+            self.opsd_config = self.teacher_server_manager.distillation_config.opsd
 
         # Load tools once per worker; each trajectory just reuses self.tools.
         tool_config_path = self.rollout_config.multi_turn.tool_config_path
@@ -942,6 +943,10 @@ class AgentLoopWorker:
     async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
         """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1]."""
         enable_async_reward = self.reward_loop_worker_handles is not None
+        reward_kwargs = kwargs
+        if self.distillation_enabled and self.opsd_config.enabled:
+            reward_kwargs = dict(kwargs)
+            reward_kwargs.pop(self.opsd_config.teacher_prompt_key, None)
 
         final_output = outputs[-1]
         if final_output.reward_score is None and enable_async_reward:
@@ -986,7 +991,7 @@ class AgentLoopWorker:
                     batch_size=n,
                 )
                 non_tensor_batch = {
-                    **{k: np.array([v] * n) for k, v in kwargs.items()},
+                    **{k: np.array([v] * n) for k, v in reward_kwargs.items()},
                     "__num_turns__": np.array([o.num_turns for o in outputs]),
                     "tool_extra_fields": np.array([o.extra_fields for o in outputs], dtype=object),
                     "prompt_len": np.array([len(o.prompt_ids) for o in outputs]),
@@ -1019,14 +1024,104 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            teacher_prompt_ids = prompt_ids
+            if self.opsd_config.enabled:
+                teacher_prompt_ids = self._get_opsd_teacher_prompt_ids(
+                    output=output,
+                    sample_kwargs=sample_kwargs,
+                )
+
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
+                sequence_ids=teacher_prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
             )
+            if self.opsd_config.enabled:
+                from verl.experimental.teacher_loop.teacher_manager import _align_teacher_response_outputs
+
+                output.extra_fields["opsd_teacher_prompt_length"] = len(teacher_prompt_ids)
+                teacher_ids, teacher_logprobs = _align_teacher_response_outputs(
+                    teacher_ids,
+                    teacher_logprobs,
+                    teacher_prompt_length=len(teacher_prompt_ids),
+                    student_prompt_length=len(prompt_ids),
+                    response_length=len(response_ids),
+                    pad_token_id=self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0,
+                )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
+    def _get_opsd_teacher_prompt_ids(
+        self,
+        *,
+        output: AgentLoopOutput,
+        sample_kwargs: Optional[dict[str, Any]],
+    ) -> list[int]:
+        """Render the privileged OPSD teacher prompt without truncation."""
+        if output.multi_modal_data:
+            raise NotImplementedError("OPSD privileged teacher prompts currently support text-only samples.")
+        if sample_kwargs is None:
+            raise ValueError("OPSD requires per-sample fields, but sample_kwargs is missing.")
+
+        prompt_key = self.opsd_config.teacher_prompt_key
+        if prompt_key not in sample_kwargs:
+            raise KeyError(
+                f"OPSD teacher prompt field {prompt_key!r} is missing from the dataset row. "
+                "Preprocess each row with a privileged teacher prompt."
+            )
+        teacher_prompt = sample_kwargs[prompt_key]
+        if isinstance(teacher_prompt, np.ndarray):
+            teacher_prompt = teacher_prompt.tolist()
+        elif isinstance(teacher_prompt, np.generic):
+            teacher_prompt = teacher_prompt.item()
+        if isinstance(teacher_prompt, tuple):
+            teacher_prompt = list(teacher_prompt)
+        if not isinstance(teacher_prompt, list) or not teacher_prompt:
+            raise TypeError(
+                f"OPSD field {prompt_key!r} must contain non-empty chat messages or token ids, "
+                f"but got {type(teacher_prompt).__name__}."
+            )
+
+        is_token_ids = all(
+            isinstance(token_id, int | np.integer) and not isinstance(token_id, bool)
+            for token_id in teacher_prompt
+        )
+        if is_token_ids:
+            teacher_prompt_ids = [int(token_id) for token_id in teacher_prompt]
+            if any(token_id < 0 for token_id in teacher_prompt_ids):
+                raise ValueError(f"OPSD field {prompt_key!r} contains a negative token id.")
+        elif all(isinstance(message, dict) for message in teacher_prompt):
+            apply_kwargs = dict(self.config.data.get("apply_chat_template_kwargs", {}))
+            apply_kwargs.update(self.opsd_config.teacher_apply_chat_template_kwargs)
+            # These are controlled explicitly below and cannot be overridden per dataset.
+            for key in ("tokenize", "add_generation_prompt", "return_dict", "return_tensors"):
+                apply_kwargs.pop(key, None)
+            tokenized_prompt = apply_chat_template(
+                self.tokenizer,
+                teacher_prompt,
+                add_generation_prompt=True,
+                tokenize=True,
+                **apply_kwargs,
+            )
+            teacher_prompt_ids = normalize_token_ids(tokenized_prompt)
+        else:
+            raise TypeError(
+                f"OPSD field {prompt_key!r} must be uniformly list[int] or list[dict], "
+                f"but received mixed elements."
+            )
+
+        if not teacher_prompt_ids:
+            raise ValueError(f"OPSD field {prompt_key!r} rendered to an empty teacher prompt.")
+
+        max_length = self.opsd_config.max_teacher_prompt_length
+        assert max_length is not None
+        if len(teacher_prompt_ids) > max_length:
+            raise ValueError(
+                f"OPSD privileged prompt has {len(teacher_prompt_ids)} tokens, exceeding "
+                f"max_teacher_prompt_length={max_length}. Reference solutions are not truncated."
+            )
+        return teacher_prompt_ids
 
     def _postprocess(
         self,
@@ -1076,7 +1171,11 @@ class AgentLoopWorker:
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            retained_non_tensor_batch = input_non_tensor_batch
+            if self.distillation_enabled and self.opsd_config.enabled:
+                retained_non_tensor_batch = dict(input_non_tensor_batch)
+                retained_non_tensor_batch.pop(self.opsd_config.teacher_prompt_key, None)
+            non_tensor_batch.update(retained_non_tensor_batch)
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
