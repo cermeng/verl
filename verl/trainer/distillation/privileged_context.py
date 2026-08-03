@@ -23,6 +23,7 @@ so the rest of verl's on-policy-distillation pipeline is reused unchanged.
 """
 
 import torch
+from verl.utils.tokenizer import normalize_token_ids
 
 # The teacher user-message wording of the OPSD reference implementation
 # (siyan-zhao/OPSD, ``SelfDistillationDataCollator``), reproduced verbatim so a
@@ -159,7 +160,7 @@ def build_privileged_chat_turn(
         add_generation_prompt=True,
         **(chat_template_kwargs or {}),
     )
-    return list(prompt_ids) + list(response_ids)
+    return normalize_token_ids(prompt_ids) + list(response_ids)
 
 
 def slice_privileged_teacher_to_student(
